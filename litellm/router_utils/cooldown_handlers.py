@@ -558,9 +558,12 @@ def should_cooldown_based_on_allowed_fails_policy(
     When *allowed_fails_override* / *cooldown_time_override* are supplied they
     take precedence over the router-level values (used by deployment-level overrides).
 
+    The counter lives in the router's shared ``DualCache`` (Redis when configured), so
+    every worker process increments the same key and the threshold applies fleet-wide.
+
     When *cache_key_suffix* is supplied the fail counter is keyed as
-    ``{deployment}:{cache_key_suffix}`` so that different exception types are
-    tracked independently per deployment.
+    ``deployment:{deployment}:allowed_fails:{cache_key_suffix}`` so that different
+    exception types are tracked independently per deployment.
 
     Returns:
     - True if fails exceed the allowed limit (should cooldown)
@@ -584,16 +587,10 @@ def should_cooldown_based_on_allowed_fails_policy(
         else (litellm_router_instance.cooldown_time or DEFAULT_COOLDOWN_TIME_SECONDS)
     )
 
-    cache_key: Final = f"{deployment}:{cache_key_suffix}" if cache_key_suffix else deployment
-    current_fails: Final = litellm_router_instance.failed_calls.get_cache(key=cache_key) or 0
-    updated_fails: Final = current_fails + 1
-
-    if updated_fails > allowed_fails:
-        return True
-    else:
-        litellm_router_instance.failed_calls.set_cache(key=cache_key, value=updated_fails, ttl=cooldown_time)
-
-    return False
+    base_key: Final = f"deployment:{deployment}:allowed_fails"
+    cache_key: Final = f"{base_key}:{cache_key_suffix}" if cache_key_suffix else base_key
+    updated_fails: Final = litellm_router_instance.cache.increment_cache(key=cache_key, value=1, ttl=cooldown_time)
+    return updated_fails > allowed_fails
 
 
 def _is_allowed_fails_set_on_router(
