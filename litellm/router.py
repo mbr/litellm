@@ -51,6 +51,7 @@ from litellm.constants import (
     DEFAULT_HEALTH_CHECK_STALENESS_MULTIPLIER,
     DEFAULT_MAX_LRU_CACHE_SIZE,
     INTERNAL_CALL_ORIGIN_METADATA_KEY,
+    OUTPUT_TOKEN_CEILING_PARAMS,
     RUNTIME_UPDATABLE_ROUTER_SETTINGS,
     SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY,
 )
@@ -12604,7 +12605,28 @@ class Router:
             request_kwargs.pop(carrier, None)
 
     @staticmethod
-    def _drop_client_effort_carriers_a_tier_pin_supersedes(
+    def _tier_ceiling_under_the_surface_name(
+        tier_litellm_params: Mapping[str, object], responses_call: bool
+    ) -> Mapping[str, object]:
+        """A tier's ``max_tokens`` is one ceiling for every surface, but the Responses
+        bridge builds its internal ``max_tokens`` from ``max_output_tokens`` and
+        would overwrite the tier's, while chat and /v1/messages never read
+        ``max_output_tokens`` at all. Spell the ceiling the way the surface reads it,
+        keeping an explicit surface-native value the operator already wrote."""
+        surface_key, foreign_key = (
+            ("max_output_tokens", "max_tokens") if responses_call else ("max_tokens", "max_output_tokens")
+        )
+        if foreign_key not in tier_litellm_params:
+            return tier_litellm_params
+        return MappingProxyType(
+            {
+                **{key: value for key, value in tier_litellm_params.items() if key != foreign_key},
+                surface_key: tier_litellm_params.get(surface_key, tier_litellm_params[foreign_key]),
+            }
+        )
+
+    @staticmethod
+    def _drop_client_carriers_a_tier_pin_supersedes(
         request_kwargs: dict[str, object],
         tier_litellm_params: Mapping[str, object],
     ) -> None:
@@ -12614,7 +12636,13 @@ class Router:
         the ``reasoning_effort`` alias, so a pinned effort only reaches the wire
         if the client's other encodings are removed before the merge. Non-effort
         fields a carrier also holds (``output_config.format``,
-        ``reasoning.summary``) are kept."""
+        ``reasoning.summary``) are kept. An output ceiling has the same shape:
+        ``max_tokens``, ``max_completion_tokens`` and ``max_output_tokens`` are
+        one setting under three names, and a provider handed two of them either
+        rejects the request or picks one by iteration order."""
+        if not OUTPUT_TOKEN_CEILING_PARAMS.isdisjoint(tier_litellm_params):
+            for carrier in OUTPUT_TOKEN_CEILING_PARAMS:
+                request_kwargs.pop(carrier, None)
         if "reasoning_effort" not in tier_litellm_params:
             return
         request_kwargs.pop("thinking", None)
@@ -12670,8 +12698,11 @@ class Router:
                     accepted_tier_params: Final = self._tier_params_the_target_accepts(
                         model, pre_routing_hook_response.litellm_params, request_kwargs
                     )
-                    self._drop_client_effort_carriers_a_tier_pin_supersedes(request_kwargs, accepted_tier_params)
-                    request_kwargs.update(accepted_tier_params)
+                    surface_tier_params: Final = self._tier_ceiling_under_the_surface_name(
+                        accepted_tier_params, responses_call=input is not None and messages is None
+                    )
+                    self._drop_client_carriers_a_tier_pin_supersedes(request_kwargs, surface_tier_params)
+                    request_kwargs.update(surface_tier_params)
             #########################################################
 
             # Resolve the strategy and logger AFTER the pre-routing hook, since
@@ -12786,8 +12817,11 @@ class Router:
                     accepted_tier_params: Final = self._tier_params_the_target_accepts(
                         model, pre_routing_hook_response.litellm_params, request_kwargs
                     )
-                    self._drop_client_effort_carriers_a_tier_pin_supersedes(request_kwargs, accepted_tier_params)
-                    request_kwargs.update(accepted_tier_params)
+                    surface_tier_params: Final = self._tier_ceiling_under_the_surface_name(
+                        accepted_tier_params, responses_call=input is not None and messages is None
+                    )
+                    self._drop_client_carriers_a_tier_pin_supersedes(request_kwargs, surface_tier_params)
+                    request_kwargs.update(surface_tier_params)
 
             # 2. Get healthy deployments
             healthy_deployments: Final = await self.async_get_healthy_deployments(
